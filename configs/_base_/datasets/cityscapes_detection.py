@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'CityscapesDataset'
-data_root = 'data/cityscapes/'
+data_root = '/home/intern/minkyoung/dataset/cityscapes/'
 
 # Example to use different file client
 # Method 1: simply set the data root and let the file I/O module
