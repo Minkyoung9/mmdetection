@@ -3,26 +3,99 @@ import argparse
 import copy
 import os
 import os.path as osp
+import numpy as np
 
-from mmengine.config import Config, DictAction
-from mmengine.dist import get_dist_info
-from mmengine.evaluator import DumpResults
-from mmengine.fileio import dump
-from mmengine.runner import Runner
-
-from mmdet.engine.hooks.utils import trigger_visualization_hook
-from mmdet.registry import RUNNERS
+import mmcv
+import torch
+from mmcv import DictAction
+from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
+from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
+                         wrap_fp16_model)
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
 from tools.analysis_tools.robustness_eval import get_results
+
+from mmdet import datasets
+from mmdet.apis import multi_gpu_test, set_random_seed, single_gpu_test
+from mmdet.core import eval_map
+from mmdet.datasets import build_dataloader, build_dataset
+from mmdet.models import build_detector
+
+
+def coco_eval_with_return(result_files,
+                          result_types,
+                          coco,
+                          max_dets=(100, 300, 1000)):
+    for res_type in result_types:
+        assert res_type in ['proposal', 'bbox', 'segm', 'keypoints']
+
+    if mmcv.is_str(coco):
+        coco = COCO(coco)
+    assert isinstance(coco, COCO)
+
+    eval_results = {}
+    for res_type in result_types:
+        result_file = result_files[res_type]
+        assert result_file.endswith('.json')
+
+        coco_dets = coco.loadRes(result_file)
+        img_ids = coco.getImgIds()
+        iou_type = 'bbox' if res_type == 'proposal' else res_type
+        cocoEval = COCOeval(coco, coco_dets, iou_type)
+        cocoEval.params.imgIds = img_ids
+        if res_type == 'proposal':
+            cocoEval.params.useCats = 0
+            cocoEval.params.maxDets = list(max_dets)
+        cocoEval.evaluate()
+        cocoEval.accumulate()
+        cocoEval.summarize()
+        if res_type == 'segm' or res_type == 'bbox':
+            metric_names = [
+                'AP', 'AP50', 'AP75', 'APs', 'APm', 'APl', 'AR1', 'AR10',
+                'AR100', 'ARs', 'ARm', 'ARl'
+            ]
+            eval_results[res_type] = {
+                metric_names[i]: cocoEval.stats[i]
+                for i in range(len(metric_names))
+            }
+        else:
+            eval_results[res_type] = cocoEval.stats
+
+    return eval_results
+
+
+def voc_eval_with_return(result_file,
+                         dataset,
+                         iou_thr=0.5,
+                         logger='print',
+                         only_ap=True):
+    det_results = mmcv.load(result_file)
+    annotations = [dataset.get_ann_info(i) for i in range(len(dataset))]
+    if hasattr(dataset, 'year') and dataset.year == 2007:
+        dataset_name = 'voc07'
+    else:
+        dataset_name = dataset.CLASSES
+    mean_ap, eval_results = eval_map(
+        det_results,
+        annotations,
+        scale_ranges=None,
+        iou_thr=iou_thr,
+        dataset=dataset_name,
+        logger=logger)
+
+    if only_ap:
+        eval_results = [{
+            'ap': eval_results[i]['ap']
+        } for i in range(len(eval_results))]
+
+    return mean_ap, eval_results
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MMDet test detector')
     parser.add_argument('config', help='test config file path')
     parser.add_argument('checkpoint', help='checkpoint file')
-    parser.add_argument(
-        '--out',
-        type=str,
-        help='dump predictions to a pickle file for offline evaluation')
+    parser.add_argument('--out', help='output result file')
     parser.add_argument(
         '--corruptions',
         type=str,
@@ -38,24 +111,38 @@ def parse_args():
         ],
         help='corruptions')
     parser.add_argument(
-        '--work-dir',
-        help='the directory to save the file containing evaluation metrics')
-    parser.add_argument(
         '--severities',
         type=int,
         nargs='+',
         default=[0, 1, 2, 3, 4, 5],
         help='corruption severity levels')
     parser.add_argument(
+        '--eval',
+        type=str,
+        nargs='+',
+        choices=['proposal', 'proposal_fast', 'bbox', 'segm', 'keypoints'],
+        help='eval types')
+    parser.add_argument(
+        '--iou-thr',
+        type=float,
+        default=0.6,
+        help='IoU threshold for pascal voc evaluation')
+    parser.add_argument(
         '--summaries',
         type=bool,
         default=False,
         help='Print summaries for every corruption and severity')
+    parser.add_argument(
+        '--workers', type=int, default=32, help='workers per gpu')
     parser.add_argument('--show', action='store_true', help='show results')
     parser.add_argument(
         '--show-dir', help='directory where painted images will be saved')
     parser.add_argument(
-        '--wait-time', type=float, default=2, help='the interval of show (s)')
+        '--show-score-thr',
+        type=float,
+        default=0.3,
+        help='score threshold (default: 0.3)')
+    parser.add_argument('--tmpdir', help='tmp dir for writing some results')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
     parser.add_argument(
         '--launcher',
@@ -86,6 +173,13 @@ def parse_args():
         'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
         'Note that the quotation marks are necessary and that no white space '
         'is allowed.')
+    parser.add_argument(
+        '--load-dataset',
+        type=str,
+        choices=['original', 'corrupted'],
+        default='original',
+        help='Add Corrupt'
+    )
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -99,43 +193,30 @@ def main():
         ('Please specify at least one operation (save or show the results) '
          'with the argument "--out", "--show" or "show-dir"')
 
-    # load config
-    cfg = Config.fromfile(args.config)
-    cfg.launcher = args.launcher
+    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
+        raise ValueError('The output file must be a pkl file.')
+
+    cfg = mmcv.Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    # set cudnn_benchmark
+    if cfg.get('cudnn_benchmark', False):
+        torch.backends.cudnn.benchmark = True
+    cfg.model.pretrained = None
+    cfg.data.test.test_mode = True
+    if args.workers == 0:
+        args.workers = cfg.data.workers_per_gpu
 
-    # work_dir is determined in this priority: CLI > segment in file > filename
-    if args.work_dir is not None:
-        # update configs according to CLI args if args.work_dir is not None
-        cfg.work_dir = args.work_dir
-    elif cfg.get('work_dir', None) is None:
-        # use config filename as default work_dir if cfg.work_dir is None
-        cfg.work_dir = osp.join('./work_dirs',
-                                osp.splitext(osp.basename(args.config))[0])
-
-    cfg.model.backbone.init_cfg.type = None
-    cfg.test_dataloader.dataset.test_mode = True
-
-    cfg.load_from = args.checkpoint
-    if args.show or args.show_dir:
-        cfg = trigger_visualization_hook(cfg, args)
-
-    # build the runner from config
-    if 'runner_type' not in cfg:
-        # build the default runner
-        runner = Runner.from_cfg(cfg)
+    # init distributed env first, since logger depends on the dist info.
+    if args.launcher == 'none':
+        distributed = False
     else:
-        # build customized runner from the registry
-        # if 'runner_type' is set in the cfg
-        runner = RUNNERS.build(cfg)
+        distributed = True
+        init_dist(args.launcher, **cfg.dist_params)
 
-    # add `DumpResults` dummy metric
-    if args.out is not None:
-        assert args.out.endswith(('.pkl', '.pickle')), \
-            'The dump file must be a pkl file.'
-        runner.test_evaluator.metrics.append(
-            DumpResults(out_file_path=args.out))
+    # set random seeds
+    if args.seed is not None:
+        set_random_seed(args.seed)
 
     if 'all' in args.corruptions:
         corruptions = [
@@ -172,6 +253,7 @@ def main():
     else:
         corruptions = args.corruptions
 
+    rank, _ = get_dist_info()
     aggregated_results = {}
     for corr_i, corruption in enumerate(corruptions):
         aggregated_results[corruption] = {}
@@ -181,41 +263,154 @@ def main():
                 aggregated_results[corruption][0] = \
                     aggregated_results[corruptions[0]][0]
                 continue
-
-            test_loader_cfg = copy.deepcopy(cfg.test_dataloader)
+            test_data_cfg = copy.deepcopy(cfg.data.test)
             # assign corruption and severity
-            if corruption_severity > 0:
-                corruption_trans = dict(
-                    type='Corrupt',
-                    corruption=corruption,
-                    severity=corruption_severity)
-                # TODO: hard coded "1", we assume that the first step is
-                # loading images, which needs to be fixed in the future
-                test_loader_cfg.dataset.pipeline.insert(1, corruption_trans)
 
-            test_loader = runner.build_dataloader(test_loader_cfg)
+            if args.load_dataset == 'original':
+                if corruption_severity > 0:
+                    corruption_trans = dict(
+                        type='Corrupt',
+                        corruption=corruption,
+                        severity=corruption_severity)
+                    # TODO: hard coded "1", we assume that the first step is
+                    # loading images, which needs to be fixed in the future
+                    test_data_cfg['pipeline'].insert(1, corruption_trans)
 
-            runner.test_loop.dataloader = test_loader
-            # set random seeds
-            if args.seed is not None:
-                runner.set_randomness(args.seed)
+            elif args.load_dataset == 'corrupted':
+                if '/cityscapes/' in test_data_cfg['img_prefix']:
+                    test_data_cfg['img_prefix'] = test_data_cfg['img_prefix'].replace('cityscapes', 'cityscapes-c')
+                    test_data_cfg['img_prefix'] = f"{test_data_cfg['img_prefix']}{corruption}/{corruption_severity}/"
+                elif '/cityscapes-c/' in test_data_cfg['img_prefix']:
+                    test_data_cfg['img_prefix'] = f"{test_data_cfg['img_prefix']}/"
+                elif '/coco/' in test_data_cfg['img_prefix']:
+                    test_data_cfg['img_prefix'] = test_data_cfg['img_prefix'].replace('coco', 'coco-c')
+                    test_data_cfg['img_prefix'] = f"{test_data_cfg['img_prefix']}{corruption}/{corruption_severity}/"
+                elif '/coco-c/' in test_data_cfg['img_prefix']:
+                    test_data_cfg['img_prefix'] = f"{test_data_cfg['img_prefix']}{corruption}/{corruption_severity}/"
+                else:
+                    if not 'cityscapes' in test_data_cfg['img_prefix']:
+                        raise NotImplementedError(
+                            "set load_dataset as 'corrupted' but use original dataset.")
+            else:
+                raise NotImplementedError(
+                    "The types of load_dataset can be 'original' or 'corrupted'.")
 
             # print info
             print(f'\nTesting {corruption} at severity {corruption_severity}')
 
-            eval_results = runner.test()
-            if args.out:
+            # build the dataloader
+            # TODO: support multiple images per gpu
+            #       (only minor changes are needed)
+            dataset = build_dataset(test_data_cfg)
+            data_loader = build_dataloader(
+                dataset,
+                samples_per_gpu=1,
+                workers_per_gpu=args.workers,
+                dist=distributed,
+                shuffle=False)
+
+            # build the model and load checkpoint
+            cfg.model.train_cfg = None
+            model = build_detector(cfg.model, test_cfg=cfg.get('test_cfg'))
+            fp16_cfg = cfg.get('fp16', None)
+            if fp16_cfg is not None:
+                wrap_fp16_model(model)
+            checkpoint = load_checkpoint(
+                model, args.checkpoint, map_location='cpu')
+            # old versions did not save class info in checkpoints,
+            # this walkaround is for backward compatibility
+            if 'CLASSES' in checkpoint.get('meta', {}):
+                model.CLASSES = checkpoint['meta']['CLASSES']
+            else:
+                model.CLASSES = dataset.CLASSES
+
+            if args.load_dataset == 'corrupted':
+                if '/VOCdevkit/' in data_loader.dataset.img_prefix:
+                    data_loader.dataset.img_prefix = data_loader.dataset.img_prefix.replace('VOCdevkit', 'VOCdevkit-C')
+                    data_loader.dataset.img_prefix = f"{data_loader.dataset.img_prefix}{corruption}/{corruption_severity}/"
+                    data_loader.dataset.use_voc_c = True
+                elif '/VOCdevkit-C/' in data_loader.dataset.img_prefix:
+                    data_loader.dataset.img_prefix = f"{data_loader.dataset.img_prefix}{corruption}/{corruption_severity}/"
+                    data_loader.dataset.use_voc_c = True
+                elif '/cityscapes-c/' in data_loader.dataset.img_prefix:
+                    data_loader.dataset.img_prefix = f"{data_loader.dataset.img_prefix}{corruption}/{corruption_severity}/"
+                    data_loader.dataset.use_voc_c = True
+                    
+
+            if not distributed:
+                model = MMDataParallel(model, device_ids=[4])
+                show_dir = args.show_dir
+                if show_dir is not None:
+                    show_dir = osp.join(show_dir, corruption)
+                    show_dir = osp.join(show_dir, str(corruption_severity))
+                    if not osp.exists(show_dir):
+                        os.makedirs(show_dir)
+                outputs = single_gpu_test(model, data_loader, args.show,
+                                          show_dir, args.show_score_thr)
+            else:
+                model = MMDistributedDataParallel(
+                    model.cuda(),
+                    device_ids=[torch.cuda.current_device()],
+                    broadcast_buffers=False)
+                outputs = multi_gpu_test(model, data_loader, args.tmpdir)
+
+            if args.out and rank == 0:
                 eval_results_filename = (
                     osp.splitext(args.out)[0] + '_results' +
                     osp.splitext(args.out)[1])
-                aggregated_results[corruption][
-                    corruption_severity] = eval_results
-                dump(aggregated_results, eval_results_filename)
+                mmcv.dump(outputs, args.out)
+                eval_types = args.eval
+                if cfg.dataset_type == 'VOCDataset':
+                    if eval_types:
+                        for eval_type in eval_types:
+                            if eval_type == 'bbox':
+                                test_dataset = mmcv.runner.obj_from_dict(
+                                    cfg.data.test, datasets)
+                                logger = 'print' if args.summaries else None
+                                mean_ap, eval_results = \
+                                    voc_eval_with_return(
+                                        args.out, test_dataset,
+                                        args.iou_thr, logger)
+                                aggregated_results[corruption][
+                                    corruption_severity] = eval_results
+                            else:
+                                print('\nOnly "bbox" evaluation \
+                                is supported for pascal voc')
+                else:
+                    if eval_types:
+                        print(f'Starting evaluate {" and ".join(eval_types)}')
+                        if eval_types == ['proposal_fast']:
+                            result_file = args.out
+                        else:
+                            if not isinstance(outputs[0], dict):
+                                result_files = dataset.results2json(
+                                    outputs, args.out)
+                            else:
+                                for name in outputs[0]:
+                                    print(f'\nEvaluating {name}')
+                                    outputs_ = [out[name] for out in outputs]
+                                    result_file = args.out
+                                    + f'.{name}'
+                                    result_files = dataset.results2json(
+                                        outputs_, result_file)
+                        if len(np.concatenate([np.concatenate(output) for output in outputs])) == 0:
+                            eval_results = dict(bbox=dict(
+                                AP=0.0, AP50=0.0, AP75=0.0, APs=0.0, APm=0.0, APl=0.0,
+                                AR1=0.0, AR10=0.0, AR100=0.0, ARs=0.0, ARm=0.0, ARl=0.0))
+                            print('NOTE: It does not include any output. 0.0 will be eval_results.')
+                        else:
+                            eval_results = coco_eval_with_return(
+                                result_files, eval_types, dataset.coco)
+                        aggregated_results[corruption][
+                            corruption_severity] = eval_results
+                    else:
+                        print('\nNo task was selected for evaluation;'
+                              '\nUse --eval to select a task')
 
-    rank, _ = get_dist_info()
+                # save results after each evaluation
+                mmcv.dump(aggregated_results, eval_results_filename)
+
     if rank == 0:
-        eval_results_filename = (
-            osp.splitext(args.out)[0] + '_results' + osp.splitext(args.out)[1])
         # print final results
         print('\nAggregated results:')
         prints = args.final_prints
@@ -227,6 +422,14 @@ def main():
                 dataset='voc',
                 prints=prints,
                 aggregate=aggregate)
+        
+        elif cfg.dataset_type == 'CityscapesDataset':
+            get_results(
+                eval_results_filename,
+                dataset='cityscapes',
+                prints=prints,
+                aggregate=aggregate)
+        
         else:
             get_results(
                 eval_results_filename,
